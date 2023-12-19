@@ -338,6 +338,8 @@ def pipe_segment_volume(
 
     Note input and output types can be arrays since function is vectorized.
     Will be faster than giving it pandas data frame.
+
+    The units of h, WT, and OD are assumed to be the same.
     """
     return np.pi * h * (OD - WT)
 
@@ -626,7 +628,7 @@ def plot_all_frac_volumetric_loss(
     OD_CV_thres: float = 0.15,
     segment_type: Optional[str] = None,
     fixed_segment_length_ft: Optional[float] = None,
-) -> Tuple[[matplotlib.figure.Figure], Tuple[int, int, int]]:
+) -> Tuple[matplotlib.figure.Figure, Tuple[int, int, int]]:
     """
     Same as `plot_annual_frac_volumetric_loss` but compile all available
     volumetric losses.
@@ -655,6 +657,30 @@ def plot_all_frac_volumetric_loss(
     return fig, stats
 
 
+# ===== Utility functions ====
+def calculate_threshold_volumetric_loss(
+    h: Union[float, np.array],
+    WT: Union[float, np.array],
+    OD: Union[float, np.array],
+    threshold_normalized_volumetric_loss: float,
+) -> Tuple[Union[float, np.array], Union[float, np.array]]:
+    """
+    Given pipe statistics all in inches, and the normalized volumetric
+    loss threshold, calculate the equivalent in absolute volumetric
+    loss.
 
+    Args:
+        h: length of pipe segment
+        WT: pipe wall thickness
+        OD: pipe outer diameter
 
+    Output:
+        absolute_loss: float or array corresponding to the absolute
+            volumetric loss corresponding to the normalized threshold value.
+        segment_volume: float or array corresponding to the total segment
+            volume for each pipe dimensions
+    """
+    segment_volume = pipe_segment_volume(h, WT, OD)
+    absolute_loss = segment_volume * threshold_normalized_volumetric_loss
+    return absolute_loss, segment_volume
     
