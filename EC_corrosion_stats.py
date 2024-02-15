@@ -74,7 +74,9 @@ def filter_manufacturing_anomalies(cleaned_identification_df: pd.DataFrame) -> p
     return filtered_df
 
 
-def get_volumetric_row_mask(segment: pd.DataFrame) -> pd.Series:
+def _get_external_anomaly_row_mask(segment: pd.DataFrame) -> pd.Series:
+    # Return row mask indidating presence of external corrosion
+
     # keep rows with non-null "Depth (%)" field
     mask_has_depth = ~segment["Depth (%)"].isna()
     # keep rows with is "External"
@@ -82,14 +84,32 @@ def get_volumetric_row_mask(segment: pd.DataFrame) -> pd.Series:
     # keep rows with "WT (in)" and "OD (in)" present
     mask_has_WT = ~segment["WT (in)"].isna()
     mask_has_OD = ~segment["OD (in)"].isna()
-    # keep rows with only "Width (in)" and "Length (in)" present
+    return (
+        mask_has_depth & mask_is_external & mask_has_WT & mask_has_OD
+    )
+
+
+def get_external_anomaly_row_mask(segment: pd.DataFrame) -> pd.Series:
+    # Return row mask indicating presence of external corrosion
+    # with width or length
+
+    is_external_mask = _get_external_anomaly_row_mask(segment)
     mask_has_width = ~segment["Width (in)"].isna()
     mask_has_length = ~segment["Length (in)"].isna()
-    # combine usable rows
-    mask_volumetric_anomalies = (
-        mask_has_depth & mask_is_external & mask_has_WT & mask_has_OD & mask_has_width & mask_has_length
+    return (
+        is_external_mask & (mask_has_length | mask_has_width)
     )
-    return mask_volumetric_anomalies
+
+
+def get_volumetric_row_mask(segment: pd.DataFrame) -> pd.Series:
+    # Return row mask indicating presence of external corrosion
+    # with all fields present to calculate volumetric loss
+    is_external_mask = _get_external_anomaly_row_mask(segment)
+    mask_has_width = ~segment["Width (in)"].isna()
+    mask_has_length = ~segment["Length (in)"].isna()
+    return (
+        is_external_mask & mask_has_length & mask_has_width
+    )
 
 
 @dataclass
