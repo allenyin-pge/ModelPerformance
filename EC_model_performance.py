@@ -51,7 +51,11 @@ def load_source_files(
     dir_for_year: str,
     cleaned_ILI_csv_fname: str,
     ILI_ECLOF_Pipesegment_joined_fname: str,
-) -> Tuple[List[str], pd.DataFrame]:
+    EC_Risk_LOF_csv_fname: Optional[str] = None,
+) -> Union[
+    Tuple[List[str], pd.DataFrame],
+    Tuple[List[str], pd.DataFrame, pd.DataFrame]
+]:
     """
     Read in the spatially-joined csv file and get the
     proper ILI headers.
@@ -64,12 +68,15 @@ def load_source_files(
             <dir_for_year>/<cleaned_ILI_csv_fname> specifies the file location.
         ILI_ECLOF_Pipesegment_joined_fname: This csv file produced from spatial-joining
             EC_LOF tables (spatialized to pipesegment) to ILI data (spatialized to pipesegment)
+        EC_Risk_LOF_csv_name: csv for corresponding year's EC_LOF_Risk table.
 
     Returns:
         ILI_headers: The column headers for cleaned ILI data. The same columns are present
             in `ILI_ECLOF_Pipesegment_joined` but with the str values cut off.
         master_dataset: This is the panda dataframe loaded from:
             <dir_for_year>/<ILI_ECLOF_Pipesegment_joined>
+        EC_Risk_LOF_table: This is the panda dataframe loaded from:
+            <dir_for_year>/<EC_LOF_Risk_csv_fname>, if given
     """
     ILI_file_name = fr'{dir_for_year}\{cleaned_ILI_csv_fname}'
     cleaned_ILI_data = pd.read_csv(ILI_file_name, low_memory=False, encoding='unicode_escape')
@@ -92,7 +99,13 @@ def load_source_files(
     master_dataset.columns.values[ILI_start: ILI_start + len(ILI_headers)] = ILI_headers
     print(f"Cleaned Spatial-joined master dataset columns: {master_dataset.columns.values}")
 
-    return ILI_headers, master_dataset
+    if EC_Risk_LOF_csv_fname is not None:
+        EC_Risk_LOF_csv_fname = fr'{dir_for_year}\{EC_Risk_LOF_csv_fname}'
+        EC_Risk_LOF_table = pd.read_csv(EC_Risk_LOF_csv_fname, low_memory=False, encoding='unicode_escape')
+        return ILI_headers, master_dataset, EC_Risk_LOF_table
+    else:
+        return ILI_headers, master_dataset
+
 
 
 def standardize_column_names_inplace(master_dataset: pd.DataFrame) -> pd.DataFrame:
@@ -390,7 +403,8 @@ def augment_dataframe_inplace(
         filtered_performance_df["af_EC"][has_nonzero_af_EC]
     )
 
-    filtered_performance_df["-Depth (%)"] = -filtered_performance_df["Depth (%)"]
+    if "-Depth (%)" not in filtered_performance_df.columns:
+        filtered_performance_df["-Depth (%)"] = -filtered_performance_df["Depth (%)"]
 
     return filtered_performance_df
 
@@ -441,7 +455,10 @@ class RouteMasks:
     numbered_line: pd.Series
 
 
-def get_route_types(df: pd.DataFrame) -> RouteMasks:
+def get_route_types(
+    df: pd.DataFrame,
+    combine_SP_backbone: bool=False,
+) -> RouteMasks:
     is_DFM = df["route"].str.contains("DFM")
     is_DREG = df["route"].str.contains("DREG")
     is_SP = df["route"].str.contains("SP")
@@ -455,16 +472,126 @@ def get_route_types(df: pd.DataFrame) -> RouteMasks:
     print(f"Xtie lines found: {df[is_Xtie]['route'].unique()}")
     print(f"Backbone lines found: {df[is_backbone]['route'].unique()}")
     print(f"Numbered lines found: {df[is_numbered_line]['route'].unique()}")
-    return RouteMasks(
-        DFM=is_DFM,
-        DREG=is_DREG,
-        SP=is_SP,
-        Xtie=is_Xtie,
-        backbone=is_backbone,
-        numbered_line=is_numbered_line,
+    if not combine_SP_backbone:
+        return RouteMasks(
+            DFM=is_DFM,
+            DREG=is_DREG,
+            SP=is_SP,  # Gordon says to merge SP and backbone lines together
+            Xtie=is_Xtie,
+            backbone=is_backbone,
+            numbered_line=is_numbered_line,
+        )
+    else:
+        return RouteMasks(
+            DFM=is_DFM,
+            DREG=is_DREG,
+            SP=pd.Series(), # empty series
+            Xtie=is_Xtie,
+            backbone=is_backbone & is_SP,
+            numbered_line=is_numbered_line,
+        )
+
+
+# =================== Interpolate segments functions ==========
+
+"""
+Not all pipe segments covered by ILI have EC-related anomalies.
+If we only compare the risk model outputs vs. ILI-based metrics for segments
+with EC-related anomalies, the measurement results can bias toward more
+unhealthy segments.
+
+To mitigate this, we do the following interpolation procedures to assign failure pressure or %-corrosion
+values to dynamic segments without ILI anomaly entries:
+- For each route available in the ILI data, find the minimum and maximum
+  (beginstationseriesid, beginstationnum, endstationnum) range. Note that each segment can be
+  uniquely identified by these combinations.
+- Out of these segments, find how many segments does not have any ILI anomalies found.
+- Assign "safe" values to these segments without any found ILI anomaly:
+    - For negative-perc-depth lost, use top 95% value from the max-aggregation results. For this
+        we assume "-Depth (%)" was aggregated after calculation rather than vice versa.
+    - For Pf/MAOP and other failure pressure fields, use top 95% value from max-aggregation results.
+"""
+
+def make_interpolate_segments(
+    EC_Risk_LOF_table: pd.DataFrame,
+    unique_ILI_segments: pd.DataFrame,
+    dict_df_aggregated: Dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """
+    Create interpolated segment dataframe from EC_Risk_LOF table
+    and aggregated segment metrics from spatial-joined ILI
+    and EC_Risk_LOF table.
+
+    Args:
+        EC_Risk_LOF_table: The original EC_Risk_LOF_table. Pipe segments
+            are uniquely identified by (beginstationseriesid, beginstationnum, endstationnum)
+            Contains a superset of all segments avaiable in each of `dict_df_aggregated`'s
+            values.
+        unique_ILI_segments: DataFrame containing information for unqiue pipe segments present
+            in ILI data. See output of `sanity_check_stationing()`.
+        dict_df_aggregated: Dictionary of aggregation type (e.g. "mean", "min", "max") to
+            dataframe of aggregated segment values. See for example how
+            `do_segment_level_aggregation()` produce its output.
+
+    Returns:
+        df_interpolated_segments: Dataframe with same columns as the values of
+            `dict_df_aggregated`. Contains information for pipe segments within the
+            ILI data range but had no EC anomaly found.
+            The `CALCULATED_RISK_FIELDS` and `AUGMENTED_RISK_FIELDS` are derived from
+            original EC_Risk_LOF_table data for these interpolated segments.
+            The `FAILURE_PRESSURE_FIELDS` and `AUGMENTED_METRIC_FIELS` are derived
+            from `dict_df_aggregated`'s values for interpolation.
+    """
+    EC_Risk_LOF_table_relevant = EC_Risk_LOF_table[
+        LOCATION_FIELDS + CALCULATED_RISK_FIELDS
+    ]
+    grouped_by_segs = EC_Risk_LOF_table_relevant.groupby(
+        ["route", "beginstationseriesid", "beginstationnum", "endstationnum", "endstationseriesid"]
     )
+    assert np.all(grouped_by_segs.size().values == 1), "Expect all pipe segments to be unique in risk table"
 
+    # Now we compile the segments that need to be interpolated and the segment information
+    df_interpolated_segments = None
+    for route in unique_ILI_segments["route"].unique():
+    
+        ILI_segments_for_route = unique_ILI_segments[unique_ILI_segments["route"] == route]
+        # find all the beginstationseriesid for these routes
+        unique_beginstationseriesid = ILI_segments_for_route["beginstationseriesid"].unique()    
+        for bssid in unique_beginstationseriesid:
+            # for each of these beginstationseriesid, find smallest and largest beginstationnum
+            cur_ILI_segments = ILI_segments_for_route[ILI_segments_for_route["beginstationseriesid"] == bssid]
+            min_beginstationnum = cur_ILI_segments["beginstationnum"].min()
+            max_beginstationnum = cur_ILI_segments["beginstationnum"].max()
+            # look for segments that fall within this range in the EC_LOF table's segments:
+            # beginstationseriesid uniquely identifies route as well!
+            cur_LOF_segments = EC_Risk_LOF_table_relevant[EC_Risk_LOF_table_relevant["beginstationseriesid"] == bssid]
+            cur_LOF_segments_in_range = cur_LOF_segments[
+                (cur_LOF_segments["beginstationnum"] > min_beginstationnum) & (cur_LOF_segments["beginstationnum"] < max_beginstationnum)
+            ]
+            # get number of segments not already in ILI
+            # convert the unique segments to python set
+            cur_ILI_set = set(map(tuple, cur_ILI_segments[["beginstationseriesid", "beginstationnum", "endstationnum"]].values))
+            cur_LOF_set = set(map(tuple, cur_LOF_segments_in_range[["beginstationseriesid", "beginstationnum", "endstationnum"]].values))
+            set_diff = cur_LOF_set.difference(cur_ILI_set)
 
+            if len(set_diff) > 0:
+                diff_segments = cur_LOF_segments[
+                    cur_LOF_segments[["beginstationseriesid", "beginstationnum", "endstationnum"]].apply(tuple, axis=1).isin(set_diff)
+                ]
+                diff_segments["route"] = route
+                if df_interpolated_segments is None:
+                    df_interpolated_segments = diff_segments
+                else:
+                    df_interpolated_segments = pd.concat([df_interpolated_segments, diff_segments], ignore_index=True)
+
+    # Now need to interpolate this frame with all the other values -- use aggregate over all route types
+    fields_to_interpolate = ["-Depth (%)"] + FAILURE_PRESSURE_FIELDS
+    df_interpolated_segments[fields_to_interpolate] = np.nan
+    df_interpolated_segments["-Depth (%)"] = dict_df_aggregated["max"]["-Depth (%)"].quantile(0.95)
+    for f in FAILURE_PRESSURE_FIELDS:
+        df_interpolated_segments[f] = dict_df_aggregated["max"][f].quantile(0.95)
+    df_interpolated_segments = augment_dataframe_inplace(df_interpolated_segments)
+    return df_interpolated_segments
 
 # =================== Plotting functions ===================
 
@@ -515,6 +642,8 @@ def make_performance_plot(
     suptitle_postfix: str,
     risk_output_type: str = "leak", # or "rupture"
     ILI_aggregation_type: str = "mean", # or anything else in dict_df_aggregated.keys()
+    route_types_to_ignore: Optional[List[str]] = None,
+    df_interpolate_segments: Optional[pd.DataFrame] = None,
 ) -> Tuple[
     matplotlib.figure.Figure,
     List[matplotlib.axes.Axes],
@@ -526,8 +655,29 @@ def make_performance_plot(
     - y_axis = ILI pipe health proxy. Bigger = better health = less risk
     - Ideally we want to see inverted relationship, or regression line going
       from top left to bottom right.
+
+    Args:
+        dict_df_aggregated: Dictionary of aggregation type (e.g. "mean", "min", "max") to
+            dataframe of aggregated segment values. See for example how
+            `do_segment_level_aggregation()` produce its output.
+        suptitle_postfix: Title of the overall plot is always in the format:
+            "Model performance metric for EC <risk_output_type>", the suptitle_postfix
+            appends to it and specifies additional information (e.g. year of the results)
+        risk_output_type: Either "leak" or "rupture". The risk model assigns a segment with
+            either leak or rupture risk, and we use different ILI measurement as the
+            ground-truth comparison.
+        route_types_to_ignore: List of route types to ignore, if given
+        df_interpolate_segments: Dataframe containing for each route, how many segments
+            to interpolate ground-truth values for, with what value, for what risk type.
+            See also `make_interpolate_segments()`.
+    
+    Returns:
+        fig: The drawn matplotlib figure
+        axes: The different subplot axes of the figure
     """
     df_to_plot = dict_df_aggregated[ILI_aggregation_type]
+    if df_interpolate_segments is not None:
+        df_to_plot = pd.concat([df_to_plot, df_interpolate_segments], ignore_index=True)
     
     # Note each row's y_label will be prefixed with route type
     if risk_output_type == "leak":
@@ -544,7 +694,7 @@ def make_performance_plot(
             "S_EC",
         ]
         # Look at leak scores when rupture LOF is 0
-        risk_score_mask = dict_df_aggregated[ILI_aggregation_type]["EC_LOF_Rupture"] == 0
+        risk_score_mask = df_to_plot["EC_LOF_Rupture"] == 0
     elif risk_output_type == "rupture":
         y_field = "Pf*/MAOP"
         y_label = "Pf*/MAOP"
@@ -559,7 +709,7 @@ def make_performance_plot(
             "S_EC",
         ]
         # Look at rupture scores when leak LOF is 0
-        risk_score_mask = dict_df_aggregated[ILI_aggregation_type]["EC_LOF_Leak"] == 0
+        risk_score_mask = df_to_plot["EC_LOF_Leak"] == 0
 
     df_to_plot = df_to_plot[risk_score_mask]
     route_masks = get_route_types(df_to_plot)
@@ -568,6 +718,11 @@ def make_performance_plot(
         for (key, value) in route_masks.__dict__.items()
         if sum(value) > 0
     }
+    if route_types_to_ignore is not None:
+        for route_type in route_types_to_ignore:
+            if route_type in dict_route_masks:
+                del dict_route_masks[route_type]
+
     route_type_list = list(dict_route_masks.keys())
     num_route_types = len(dict_route_masks)
 
