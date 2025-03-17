@@ -547,7 +547,8 @@ def plot_distribution_and_sd(
 ) -> Tuple[float, float, float]:
     """
     Returns:
-        (mean, +1*SD, +2*SD) values in the original scale of the data
+        (mean, +1*SD, +2*SD) values in the original scale of the data,
+        or log-transformed data if `log_transform_data` is True.
     """
     if log_transform_data:
         data = np.log(data)
